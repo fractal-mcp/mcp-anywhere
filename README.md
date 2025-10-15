@@ -6,7 +6,7 @@ A fork of the [official Model Context Protocol TypeScript SDK](https://github.co
 
 ## The Problem
 
-The official [@modelcontextprotocol/sdk](https://github.com/modelcontextprotocol/typescript-sdk) is an excellent implementation of the MCP specification, but it was designed primarily for Node.js environments. When attempting to use it in:
+The official [@modelcontextprotocol/sdk](https://github.com/modelcontextprotocol/typescript-sdk) was designed primarily for Node.js environments. When attempting to use it in:
 
 - **Browser environments** (via bundlers like Webpack, Vite, esbuild)
 - **Cloudflare Workers** (V8 isolates with Web APIs)
