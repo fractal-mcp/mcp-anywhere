@@ -26,19 +26,38 @@
         "universal"
     ],
     "exports": {
-        ".": {
-            "import": "./dist/esm/index.js",
-            "require": "./dist/cjs/index.js"
-        },
         "./client": {
+            "types": "./dist/esm/client/index.d.ts",
             "import": "./dist/esm/client/index.js",
             "require": "./dist/cjs/client/index.js"
         },
+        "./client/*": {
+            "types": "./dist/esm/client/*.d.ts",
+            "import": "./dist/esm/client/*",
+            "require": "./dist/cjs/client/*"
+        },
         "./server": {
+            "types": "./dist/esm/server/index.d.ts",
             "import": "./dist/esm/server/index.js",
             "require": "./dist/cjs/server/index.js"
         },
+        "./server/*": {
+            "types": "./dist/esm/server/*.d.ts",
+            "import": "./dist/esm/server/*",
+            "require": "./dist/cjs/server/*"
+        },
+        "./types": {
+            "types": "./dist/esm/types.d.ts",
+            "import": "./dist/esm/types.js",
+            "require": "./dist/cjs/types.js"
+        },
+        "./shared/*": {
+            "types": "./dist/esm/shared/*.d.ts",
+            "import": "./dist/esm/shared/*",
+            "require": "./dist/cjs/shared/*"
+        },
         "./*": {
+            "types": "./dist/esm/*.d.ts",
             "import": "./dist/esm/*",
             "require": "./dist/cjs/*"
         }
