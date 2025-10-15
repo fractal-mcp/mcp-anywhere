@@ -1,10 +1,54 @@
-import { ChildProcess, IOType } from 'node:child_process';
-import spawn from 'cross-spawn';
-import process from 'node:process';
-import { Stream, PassThrough } from 'node:stream';
 import { ReadBuffer, serializeMessage } from '../shared/stdio.js';
 import { Transport } from '../shared/transport.js';
 import { JSONRPCMessage } from '../types.js';
+
+// Check if we're in a Node.js environment
+const isNode = typeof process !== 'undefined' && process.versions != null && process.versions.node != null;
+
+// Node.js types
+interface NodeChildProcess {
+    on(event: 'error', listener: (error: Error) => void): void;
+    on(event: 'spawn', listener: () => void): void;
+    on(event: 'close', listener: (code: number) => void): void;
+    stdin?: {
+        on(event: 'error', listener: (error: Error) => void): void;
+        write(chunk: string): boolean;
+        once(event: 'drain', listener: () => void): void;
+    };
+    stdout?: {
+        on(event: 'data', listener: (chunk: Buffer) => void): void;
+        on(event: 'error', listener: (error: Error) => void): void;
+    };
+    stderr?: {
+        pipe(destination: NodePassThrough): void;
+    };
+    pid?: number;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+interface NodePassThrough {
+    // PassThrough stream interface
+}
+
+type IOType = unknown;
+type Stream = unknown;
+type ChildProcess = NodeChildProcess;
+type PassThrough = NodePassThrough;
+
+type SpawnFunction = (
+    command: string,
+    args: string[],
+    options: {
+        env: Record<string, string>;
+        stdio: Array<string | number | unknown>;
+        shell: boolean;
+        signal: AbortSignal;
+        windowsHide: boolean;
+        cwd?: string;
+    }
+) => ChildProcess;
+
+type PassThroughConstructor = new () => PassThrough;
 
 export type StdioServerParameters = {
     /**
@@ -43,7 +87,7 @@ export type StdioServerParameters = {
  * Environment variables to inherit by default, if an environment is not explicitly given.
  */
 export const DEFAULT_INHERITED_ENV_VARS =
-    process.platform === 'win32'
+    isNode && (globalThis as unknown as { process: { platform: string } }).process.platform === 'win32'
         ? [
               'APPDATA',
               'HOMEDRIVE',
@@ -65,10 +109,15 @@ export const DEFAULT_INHERITED_ENV_VARS =
  * Returns a default environment object including only environment variables deemed safe to inherit.
  */
 export function getDefaultEnvironment(): Record<string, string> {
+    if (!isNode) {
+        return {};
+    }
+
     const env: Record<string, string> = {};
+    const processEnv = (globalThis as unknown as { process: { env: Record<string, string | undefined> } }).process.env;
 
     for (const key of DEFAULT_INHERITED_ENV_VARS) {
-        const value = process.env[key];
+        const value = processEnv[key];
         if (value === undefined) {
             continue;
         }
@@ -88,6 +137,7 @@ export function getDefaultEnvironment(): Record<string, string> {
  * Client transport for stdio: this will connect to a server by spawning a process and communicating with it over stdin/stdout.
  *
  * This transport is only available in Node.js environments.
+ * In browser/edge environments, attempting to use this will throw an error.
  */
 export class StdioClientTransport implements Transport {
     private _process?: ChildProcess;
@@ -95,15 +145,40 @@ export class StdioClientTransport implements Transport {
     private _readBuffer: ReadBuffer = new ReadBuffer();
     private _serverParams: StdioServerParameters;
     private _stderrStream: PassThrough | null = null;
+    private _spawn?: SpawnFunction;
+    private _PassThrough?: PassThroughConstructor;
 
     onclose?: () => void;
     onerror?: (error: Error) => void;
     onmessage?: (message: JSONRPCMessage) => void;
 
     constructor(server: StdioServerParameters) {
+        if (!isNode) {
+            throw new Error(
+                'StdioClientTransport is only available in Node.js environments. Use SSEClientTransport or WebSocketClientTransport for browsers and edge runtimes.'
+            );
+        }
+
         this._serverParams = server;
-        if (server.stderr === 'pipe' || server.stderr === 'overlapped') {
-            this._stderrStream = new PassThrough();
+    }
+
+    private async loadNodeModules() {
+        if (!this._spawn) {
+            try {
+                const spawnMod = await import('cross-spawn');
+                this._spawn = spawnMod.default as SpawnFunction;
+            } catch {
+                throw new Error('cross-spawn is required for StdioClientTransport');
+            }
+        }
+
+        if (!this._PassThrough) {
+            const streamMod = await import('node:stream');
+            this._PassThrough = streamMod.PassThrough as PassThroughConstructor;
+
+            if (this._serverParams.stderr === 'pipe' || this._serverParams.stderr === 'overlapped') {
+                this._stderrStream = new this._PassThrough();
+            }
         }
     }
 
@@ -117,8 +192,12 @@ export class StdioClientTransport implements Transport {
             );
         }
 
+        await this.loadNodeModules();
+
+        const proc = (globalThis as unknown as { process: { platform: string } }).process;
+
         return new Promise((resolve, reject) => {
-            this._process = spawn(this._serverParams.command, this._serverParams.args ?? [], {
+            this._process = this._spawn!(this._serverParams.command, this._serverParams.args ?? [], {
                 // merge default env with server env because mcp server needs some env vars
                 env: {
                     ...getDefaultEnvironment(),
@@ -127,11 +206,11 @@ export class StdioClientTransport implements Transport {
                 stdio: ['pipe', 'pipe', this._serverParams.stderr ?? 'inherit'],
                 shell: false,
                 signal: this._abortController.signal,
-                windowsHide: process.platform === 'win32' && isElectron(),
+                windowsHide: proc.platform === 'win32' && isElectron(),
                 cwd: this._serverParams.cwd
             });
 
-            this._process.on('error', error => {
+            this._process.on('error', (error: Error) => {
                 if (error.name === 'AbortError') {
                     // Expected when close() is called.
                     this.onclose?.();
@@ -146,21 +225,21 @@ export class StdioClientTransport implements Transport {
                 resolve();
             });
 
-            this._process.on('close', _code => {
+            this._process.on('close', (_code: number) => {
                 this._process = undefined;
                 this.onclose?.();
             });
 
-            this._process.stdin?.on('error', error => {
+            this._process.stdin?.on('error', (error: Error) => {
                 this.onerror?.(error);
             });
 
-            this._process.stdout?.on('data', chunk => {
+            this._process.stdout?.on('data', (chunk: Buffer) => {
                 this._readBuffer.append(chunk);
                 this.processReadBuffer();
             });
 
-            this._process.stdout?.on('error', error => {
+            this._process.stdout?.on('error', (error: Error) => {
                 this.onerror?.(error);
             });
 

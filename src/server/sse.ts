@@ -1,13 +1,22 @@
-import { randomUUID } from 'node:crypto';
-import { IncomingMessage, ServerResponse } from 'node:http';
 import { Transport } from '../shared/transport.js';
 import { JSONRPCMessage, JSONRPCMessageSchema, MessageExtraInfo, RequestInfo } from '../types.js';
-import getRawBody from 'raw-body';
 import contentType from 'content-type';
-import { AuthInfo } from './auth/types.js';
-import { URL } from 'url';
+import type { AuthInfo } from './auth/types.js';
 
-const MAXIMUM_MESSAGE_SIZE = '4mb';
+const MAXIMUM_MESSAGE_SIZE = 4 * 1024 * 1024; // 4MB in bytes
+
+function generateSessionId(): string {
+    if (typeof globalThis.crypto !== 'undefined' && typeof globalThis.crypto.randomUUID === 'function') {
+        return globalThis.crypto.randomUUID();
+    }
+    // Simple UUID v4 polyfill for environments without Web Crypto
+    const template = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx';
+    return template.replace(/[xy]/g, c => {
+        const r = (Math.random() * 16) | 0;
+        const v = c === 'x' ? r : (r & 0x3) | 0x8;
+        return v.toString(16);
+    });
+}
 
 /**
  * Configuration options for SSEServerTransport.
@@ -32,13 +41,29 @@ export interface SSEServerTransportOptions {
     enableDnsRebindingProtection?: boolean;
 }
 
+// Type for the response object (compatible with both Node ServerResponse and Fetch-style responses)
+interface ResponseLike {
+    writeHead(statusCode: number, headers?: Record<string, string>): ResponseLike;
+    write(chunk: string): boolean | void;
+    end(chunk?: string): void;
+    on?(event: string, listener: (...args: unknown[]) => void): void;
+}
+
+// Type for the request object (compatible with both Node IncomingMessage and Fetch Request)
+interface RequestLike {
+    headers: Record<string, string | string[] | undefined> | Headers;
+    auth?: AuthInfo;
+    text?: () => Promise<string>;
+    on?(event: string, listener: (...args: unknown[]) => void): void;
+}
+
 /**
  * Server transport for SSE: this will send messages over an SSE connection and receive messages from HTTP POST requests.
  *
- * This transport is only available in Node.js environments.
+ * This transport uses Web APIs and is compatible with browsers, edge runtimes, and Node.js 18+.
  */
 export class SSEServerTransport implements Transport {
-    private _sseResponse?: ServerResponse;
+    private _sseResponse?: ResponseLike;
     private _sessionId: string;
     private _options: SSEServerTransportOptions;
     onclose?: () => void;
@@ -50,10 +75,10 @@ export class SSEServerTransport implements Transport {
      */
     constructor(
         private _endpoint: string,
-        private res: ServerResponse,
+        private res: ResponseLike,
         options?: SSEServerTransportOptions
     ) {
-        this._sessionId = randomUUID();
+        this._sessionId = generateSessionId();
         this._options = options || { enableDnsRebindingProtection: false };
     }
 
@@ -61,15 +86,23 @@ export class SSEServerTransport implements Transport {
      * Validates request headers for DNS rebinding protection.
      * @returns Error message if validation fails, undefined if validation passes.
      */
-    private validateRequestHeaders(req: IncomingMessage): string | undefined {
+    private validateRequestHeaders(headers: Record<string, string | string[] | undefined> | Headers): string | undefined {
         // Skip validation if protection is not enabled
         if (!this._options.enableDnsRebindingProtection) {
             return undefined;
         }
 
+        const getHeader = (name: string): string | undefined => {
+            if (headers instanceof Headers) {
+                return headers.get(name) || undefined;
+            }
+            const value = headers[name.toLowerCase()];
+            return Array.isArray(value) ? value[0] : value;
+        };
+
         // Validate Host header if allowedHosts is configured
         if (this._options.allowedHosts && this._options.allowedHosts.length > 0) {
-            const hostHeader = req.headers.host;
+            const hostHeader = getHeader('host');
             if (!hostHeader || !this._options.allowedHosts.includes(hostHeader)) {
                 return `Invalid Host header: ${hostHeader}`;
             }
@@ -77,7 +110,7 @@ export class SSEServerTransport implements Transport {
 
         // Validate Origin header if allowedOrigins is configured
         if (this._options.allowedOrigins && this._options.allowedOrigins.length > 0) {
-            const originHeader = req.headers.origin;
+            const originHeader = getHeader('origin');
             if (!originHeader || !this._options.allowedOrigins.includes(originHeader)) {
                 return `Invalid Origin header: ${originHeader}`;
             }
@@ -115,10 +148,14 @@ export class SSEServerTransport implements Transport {
         this.res.write(`event: endpoint\ndata: ${relativeUrlWithSession}\n\n`);
 
         this._sseResponse = this.res;
-        this.res.on('close', () => {
-            this._sseResponse = undefined;
-            this.onclose?.();
-        });
+
+        // Set up close handler if available
+        if (this.res.on) {
+            this.res.on('close', () => {
+                this._sseResponse = undefined;
+                this.onclose?.();
+            });
+        }
     }
 
     /**
@@ -126,7 +163,7 @@ export class SSEServerTransport implements Transport {
      *
      * This should be called when a POST request is made to send a message to the server.
      */
-    async handlePostMessage(req: IncomingMessage & { auth?: AuthInfo }, res: ServerResponse, parsedBody?: unknown): Promise<void> {
+    async handlePostMessage(req: RequestLike, res: ResponseLike, parsedBody?: unknown): Promise<void> {
         if (!this._sseResponse) {
             const message = 'SSE connection not established';
             res.writeHead(500).end(message);
@@ -134,7 +171,7 @@ export class SSEServerTransport implements Transport {
         }
 
         // Validate request headers for DNS rebinding protection
-        const validationError = this.validateRequestHeaders(req);
+        const validationError = this.validateRequestHeaders(req.headers);
         if (validationError) {
             res.writeHead(403).end(validationError);
             this.onerror?.(new Error(validationError));
@@ -142,21 +179,64 @@ export class SSEServerTransport implements Transport {
         }
 
         const authInfo: AuthInfo | undefined = req.auth;
-        const requestInfo: RequestInfo = { headers: req.headers };
+
+        // Convert headers to plain object
+        const requestInfo: RequestInfo = {
+            headers:
+                req.headers instanceof Headers
+                    ? Object.fromEntries(req.headers.entries())
+                    : (req.headers as Record<string, string | string[] | undefined>)
+        };
 
         let body: string | unknown;
         try {
-            const ct = contentType.parse(req.headers['content-type'] ?? '');
+            const getHeader = (name: string): string | undefined => {
+                if (req.headers instanceof Headers) {
+                    return req.headers.get(name) || undefined;
+                }
+                const value = req.headers[name.toLowerCase()];
+                return Array.isArray(value) ? value[0] : value;
+            };
+
+            const contentTypeHeader = getHeader('content-type') ?? '';
+            const ct = contentType.parse(contentTypeHeader);
             if (ct.type !== 'application/json') {
                 throw new Error(`Unsupported content-type: ${ct.type}`);
             }
 
-            body =
-                parsedBody ??
-                (await getRawBody(req, {
-                    limit: MAXIMUM_MESSAGE_SIZE,
-                    encoding: ct.parameters.charset ?? 'utf-8'
-                }));
+            if (parsedBody !== undefined) {
+                body = parsedBody;
+            } else if (req.text) {
+                // Fetch-style Request
+                const bodyText = await req.text();
+                if (bodyText.length > MAXIMUM_MESSAGE_SIZE) {
+                    throw new Error('Request body too large');
+                }
+                body = bodyText;
+            } else if (req.on) {
+                // Node-style IncomingMessage
+                const chunks: Buffer[] = [];
+                let totalLength = 0;
+
+                await new Promise<void>((resolve, reject) => {
+                    req.on!('data', (...args: unknown[]) => {
+                        const chunk = args[0] as Buffer;
+                        totalLength += chunk.length;
+                        if (totalLength > MAXIMUM_MESSAGE_SIZE) {
+                            reject(new Error('Request body too large'));
+                            return;
+                        }
+                        chunks.push(chunk);
+                    });
+                    req.on!('end', () => resolve());
+                    req.on!('error', reject);
+                });
+
+                const encoding = ct.parameters.charset ?? 'utf-8';
+                body = Buffer.concat(chunks).toString(encoding as BufferEncoding);
+            } else {
+                throw new Error('Unable to read request body');
+            }
         } catch (error) {
             res.writeHead(400).end(String(error));
             this.onerror?.(error as Error);

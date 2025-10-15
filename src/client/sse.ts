@@ -1,13 +1,19 @@
-import { EventSource, type ErrorEvent, type EventSourceInit } from 'eventsource';
+import type { EventSourceMessage } from 'eventsource-parser';
+import { EventSourceParserStream } from 'eventsource-parser/stream';
 import { Transport, FetchLike } from '../shared/transport.js';
 import { JSONRPCMessage, JSONRPCMessageSchema } from '../types.js';
 import { auth, AuthResult, extractResourceMetadataUrl, OAuthClientProvider, UnauthorizedError } from './auth.js';
+
+type SSEEventSourceInit = EventSourceInit & {
+    fetch?: FetchLike;
+    headers?: HeadersInit;
+};
 
 export class SseError extends Error {
     constructor(
         public readonly code: number | undefined,
         message: string | undefined,
-        public readonly event: ErrorEvent
+        public readonly event?: unknown
     ) {
         super(`SSE error: ${message}`);
     }
@@ -41,7 +47,7 @@ export type SSEClientTransportOptions = {
      * also given. This can be worked around by setting the `Authorization` header
      * manually.
      */
-    eventSourceInit?: EventSourceInit;
+    eventSourceInit?: SSEEventSourceInit;
 
     /**
      * Customizes recurring POST requests to the server.
@@ -59,16 +65,17 @@ export type SSEClientTransportOptions = {
  * messages and make separate POST requests for sending messages.
  */
 export class SSEClientTransport implements Transport {
-    private _eventSource?: EventSource;
     private _endpoint?: URL;
     private _abortController?: AbortController;
+    private _reader?: ReadableStreamDefaultReader<EventSourceMessage>;
     private _url: URL;
     private _resourceMetadataUrl?: URL;
-    private _eventSourceInit?: EventSourceInit;
+    private _eventSourceInit?: SSEEventSourceInit;
     private _requestInit?: RequestInit;
     private _authProvider?: OAuthClientProvider;
     private _fetch?: FetchLike;
     private _protocolVersion?: string;
+    private _didEmitClose = false;
 
     onclose?: () => void;
     onerror?: (error: Error) => void;
@@ -122,83 +129,190 @@ export class SSEClientTransport implements Transport {
         return new Headers({ ...headers, ...this._requestInit?.headers });
     }
 
-    private _startOrAuth(): Promise<void> {
-        const fetchImpl = (this?._eventSourceInit?.fetch ?? this._fetch ?? fetch) as typeof fetch;
-        return new Promise((resolve, reject) => {
-            this._eventSource = new EventSource(this._url.href, {
-                ...this._eventSourceInit,
-                fetch: async (url, init) => {
-                    const headers = await this._commonHeaders();
-                    headers.set('Accept', 'text/event-stream');
-                    const response = await fetchImpl(url, {
-                        ...init,
-                        headers
-                    });
+    private _mergeHeaders(target: Headers, headers?: HeadersInit): void {
+        if (!headers) {
+            return;
+        }
 
-                    if (response.status === 401 && response.headers.has('www-authenticate')) {
-                        this._resourceMetadataUrl = extractResourceMetadataUrl(response);
-                    }
-
-                    return response;
-                }
-            });
-            this._abortController = new AbortController();
-
-            this._eventSource.onerror = event => {
-                if (event.code === 401 && this._authProvider) {
-                    this._authThenStart().then(resolve, reject);
-                    return;
-                }
-
-                const error = new SseError(event.code, event.message, event);
-                reject(error);
-                this.onerror?.(error);
-            };
-
-            this._eventSource.onopen = () => {
-                // The connection is open, but we need to wait for the endpoint to be received.
-            };
-
-            this._eventSource.addEventListener('endpoint', (event: Event) => {
-                const messageEvent = event as MessageEvent;
-
-                try {
-                    this._endpoint = new URL(messageEvent.data, this._url);
-                    if (this._endpoint.origin !== this._url.origin) {
-                        throw new Error(`Endpoint origin does not match connection origin: ${this._endpoint.origin}`);
-                    }
-                } catch (error) {
-                    reject(error);
-                    this.onerror?.(error as Error);
-
-                    void this.close();
-                    return;
-                }
-
-                resolve();
-            });
-
-            this._eventSource.onmessage = (event: Event) => {
-                const messageEvent = event as MessageEvent;
-                let message: JSONRPCMessage;
-                try {
-                    message = JSONRPCMessageSchema.parse(JSON.parse(messageEvent.data));
-                } catch (error) {
-                    this.onerror?.(error as Error);
-                    return;
-                }
-
-                this.onmessage?.(message);
-            };
+        const source = new Headers(headers);
+        source.forEach((value, key) => {
+            target.set(key, value);
         });
     }
 
-    async start() {
-        if (this._eventSource) {
+    private _emitClose(): void {
+        if (this._didEmitClose) {
+            return;
+        }
+        this._didEmitClose = true;
+        this.onclose?.();
+    }
+
+    private async _startStream(fetchImpl: typeof fetch): Promise<void> {
+        this._didEmitClose = false;
+        this._endpoint = undefined;
+
+        const controller = new AbortController();
+        this._abortController = controller;
+        const abortSignal = controller.signal;
+
+        const headers = await this._commonHeaders();
+        this._mergeHeaders(headers, this._eventSourceInit?.headers);
+        headers.set('Accept', 'text/event-stream');
+
+        const requestInit: RequestInit = {
+            method: 'GET',
+            headers,
+            signal: abortSignal
+        };
+
+        if (this._eventSourceInit?.withCredentials === true) {
+            requestInit.credentials = 'include';
+        } else if (this._eventSourceInit?.withCredentials === false) {
+            requestInit.credentials = 'omit';
+        }
+
+        let response: Response;
+        try {
+            response = await fetchImpl(this._url, requestInit);
+        } catch (error) {
+            controller.abort();
+            this._abortController = undefined;
+            this.onerror?.(error as Error);
+            throw error;
+        }
+
+        if (response.status === 401 && response.headers.has('www-authenticate')) {
+            this._resourceMetadataUrl = extractResourceMetadataUrl(response);
+        }
+
+        if (response.status === 401) {
+            await response.body?.cancel?.().catch(() => {});
+            this._abortController = undefined;
+
+            if (this._authProvider) {
+                return await this._authThenStart();
+            }
+
+            const error = new UnauthorizedError();
+            this.onerror?.(error);
+            throw error;
+        }
+
+        if (!response.ok) {
+            const message = await response.text().catch(() => undefined);
+            const error = new SseError(response.status, message, response);
+            this._abortController = undefined;
+            this.onerror?.(error);
+            throw error;
+        }
+
+        if (!response.body) {
+            const error = new Error('SSE response did not include a body');
+            this._abortController = undefined;
+            this.onerror?.(error);
+            throw error;
+        }
+
+        const reader = response.body.pipeThrough(new TextDecoderStream()).pipeThrough(new EventSourceParserStream()).getReader();
+
+        this._reader = reader;
+
+        return await new Promise((resolve, reject) => {
+            let resolved = false;
+
+            const resolveOnce = () => {
+                if (!resolved) {
+                    resolved = true;
+                    resolve();
+                }
+            };
+
+            const finish = (options: { error?: Error; aborted?: boolean } = {}) => {
+                this._reader = undefined;
+                this._abortController = undefined;
+
+                if (!resolved) {
+                    if (options.error) {
+                        reject(options.error);
+                    } else if (options.aborted) {
+                        reject(new Error('SSE connection aborted'));
+                    } else {
+                        reject(new Error('SSE connection ended before receiving endpoint event'));
+                    }
+                } else if (options.error) {
+                    this.onerror?.(options.error);
+                } else {
+                    this._emitClose();
+                }
+            };
+
+            const process = async () => {
+                try {
+                    while (true) {
+                        const { value, done } = await reader.read();
+
+                        if (done) {
+                            finish({ aborted: abortSignal.aborted });
+                            return;
+                        }
+
+                        if (!value) {
+                            continue;
+                        }
+
+                        const eventName = value.event ?? 'message';
+
+                        if (eventName === 'endpoint') {
+                            try {
+                                this._endpoint = new URL(value.data, this._url);
+                                if (this._endpoint.origin !== this._url.origin) {
+                                    throw new Error(`Endpoint origin does not match connection origin: ${this._endpoint.origin}`);
+                                }
+                            } catch (error) {
+                                finish({ error: error as Error });
+                                return;
+                            }
+
+                            resolveOnce();
+                            continue;
+                        }
+
+                        if (!resolved) {
+                            continue;
+                        }
+
+                        try {
+                            const message = JSONRPCMessageSchema.parse(JSON.parse(value.data));
+                            this.onmessage?.(message);
+                        } catch (error) {
+                            this.onerror?.(error as Error);
+                        }
+                    }
+                } catch (error) {
+                    if ((error as DOMException).name === 'AbortError' || abortSignal.aborted) {
+                        finish({ aborted: true });
+                        return;
+                    }
+                    finish({ error: error as Error });
+                }
+            };
+
+            void process();
+        });
+    }
+
+    private _startOrAuth(): Promise<void> {
+        const fetchImpl = (this?._eventSourceInit?.fetch ?? this._fetch ?? fetch) as typeof fetch;
+        return this._startStream(fetchImpl);
+    }
+
+    async start(): Promise<void> {
+        if (this._abortController || this._reader) {
             throw new Error('SSEClientTransport already started! If using Client class, note that connect() calls start() automatically.');
         }
 
-        return await this._startOrAuth();
+        await this._startOrAuth();
     }
 
     /**
@@ -221,9 +335,21 @@ export class SSEClientTransport implements Transport {
     }
 
     async close(): Promise<void> {
-        this._abortController?.abort();
-        this._eventSource?.close();
-        this.onclose?.();
+        if (this._abortController) {
+            this._abortController.abort();
+            this._abortController = undefined;
+        }
+
+        if (this._reader) {
+            try {
+                await this._reader.cancel();
+            } catch {
+                // Ignore cancellation errors.
+            }
+            this._reader = undefined;
+        }
+
+        this._emitClose();
     }
 
     async send(message: JSONRPCMessage): Promise<void> {
@@ -242,7 +368,8 @@ export class SSEClientTransport implements Transport {
                 signal: this._abortController?.signal
             };
 
-            const response = await (this._fetch ?? fetch)(this._endpoint, init);
+            const fetchImpl = (this._fetch ?? fetch) as typeof fetch;
+            const response = await fetchImpl(this._endpoint, init);
             if (!response.ok) {
                 if (response.status === 401 && this._authProvider) {
                     this._resourceMetadataUrl = extractResourceMetadataUrl(response);
@@ -256,7 +383,6 @@ export class SSEClientTransport implements Transport {
                         throw new UnauthorizedError();
                     }
 
-                    // Purposely _not_ awaited, so we don't call onerror twice
                     return this.send(message);
                 }
 

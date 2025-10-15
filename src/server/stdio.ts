@@ -1,22 +1,48 @@
-import process from 'node:process';
-import { Readable, Writable } from 'node:stream';
 import { ReadBuffer, serializeMessage } from '../shared/stdio.js';
 import { JSONRPCMessage } from '../types.js';
 import { Transport } from '../shared/transport.js';
+
+// Check if we're in a Node.js environment
+const isNode = typeof process !== 'undefined' && process.versions != null && process.versions.node != null;
+
+// Node.js stream types
+interface NodeReadable {
+    on(event: 'data', listener: (chunk: Buffer) => void): void;
+    on(event: 'error', listener: (error: Error) => void): void;
+    off(event: 'data', listener: (chunk: Buffer) => void): void;
+    off(event: 'error', listener: (error: Error) => void): void;
+    listenerCount(event: string): number;
+    pause(): void;
+}
+
+interface NodeWritable {
+    write(chunk: string): boolean;
+    once(event: 'drain', listener: () => void): void;
+}
 
 /**
  * Server transport for stdio: this communicates with a MCP client by reading from the current process' stdin and writing to stdout.
  *
  * This transport is only available in Node.js environments.
+ * In browser/edge environments, attempting to use this will throw an error.
  */
 export class StdioServerTransport implements Transport {
     private _readBuffer: ReadBuffer = new ReadBuffer();
     private _started = false;
+    private _stdin: NodeReadable;
+    private _stdout: NodeWritable;
 
-    constructor(
-        private _stdin: Readable = process.stdin,
-        private _stdout: Writable = process.stdout
-    ) {}
+    constructor(stdin?: NodeReadable, stdout?: NodeWritable) {
+        if (!isNode) {
+            throw new Error(
+                'StdioServerTransport is only available in Node.js environments. Use SSEServerTransport or StreamableHTTPServerTransport for browsers and edge runtimes.'
+            );
+        }
+
+        // In Node.js, process is available globally
+        this._stdin = stdin ?? ((globalThis as unknown as { process: { stdin: NodeReadable } }).process.stdin as NodeReadable);
+        this._stdout = stdout ?? ((globalThis as unknown as { process: { stdout: NodeWritable } }).process.stdout as NodeWritable);
+    }
 
     onclose?: () => void;
     onerror?: (error: Error) => void;

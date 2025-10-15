@@ -1,4 +1,3 @@
-import { IncomingMessage, ServerResponse } from 'node:http';
 import { Transport } from '../shared/transport.js';
 import {
     MessageExtraInfo,
@@ -13,12 +12,41 @@ import {
     SUPPORTED_PROTOCOL_VERSIONS,
     DEFAULT_NEGOTIATED_PROTOCOL_VERSION
 } from '../types.js';
-import getRawBody from 'raw-body';
 import contentType from 'content-type';
-import { randomUUID } from 'node:crypto';
 import { AuthInfo } from './auth/types.js';
 
-const MAXIMUM_MESSAGE_SIZE = '4mb';
+const MAXIMUM_MESSAGE_SIZE = 4 * 1024 * 1024; // 4MB in bytes
+
+function generateUUID(): string {
+    if (typeof globalThis.crypto !== 'undefined' && typeof globalThis.crypto.randomUUID === 'function') {
+        return globalThis.crypto.randomUUID();
+    }
+    // Simple UUID v4 polyfill for environments without Web Crypto
+    const template = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx';
+    return template.replace(/[xy]/g, c => {
+        const r = (Math.random() * 16) | 0;
+        const v = c === 'x' ? r : (r & 0x3) | 0x8;
+        return v.toString(16);
+    });
+}
+
+// Type for the response object (compatible with both Node ServerResponse and Fetch-style responses)
+interface ResponseLike {
+    writeHead(statusCode: number, headers?: Record<string, string>): ResponseLike;
+    write(chunk: string): boolean | void;
+    end(chunk?: string): void;
+    flushHeaders?(): void;
+    on?(event: string, listener: (...args: unknown[]) => void): void;
+}
+
+// Type for the request object (compatible with both Node IncomingMessage and Fetch Request)
+interface RequestLike {
+    method?: string;
+    headers: Record<string, string | string[] | undefined> | Headers;
+    auth?: AuthInfo;
+    text?: () => Promise<string>;
+    on?(event: string, listener: (...args: unknown[]) => void): void;
+}
 
 export type StreamId = string;
 export type EventId = string;
@@ -148,7 +176,7 @@ export class StreamableHTTPServerTransport implements Transport {
     // when sessionId is not set (undefined), it means the transport is in stateless mode
     private sessionIdGenerator: (() => string) | undefined;
     private _started: boolean = false;
-    private _streamMapping: Map<string, ServerResponse> = new Map();
+    private _streamMapping: Map<string, ResponseLike> = new Map();
     private _requestToStreamMapping: Map<RequestId, string> = new Map();
     private _requestResponseMap: Map<RequestId, JSONRPCMessage> = new Map();
     private _initialized: boolean = false;
@@ -192,15 +220,23 @@ export class StreamableHTTPServerTransport implements Transport {
      * Validates request headers for DNS rebinding protection.
      * @returns Error message if validation fails, undefined if validation passes.
      */
-    private validateRequestHeaders(req: IncomingMessage): string | undefined {
+    private validateRequestHeaders(headers: Record<string, string | string[] | undefined> | Headers): string | undefined {
         // Skip validation if protection is not enabled
         if (!this._enableDnsRebindingProtection) {
             return undefined;
         }
 
+        const getHeader = (name: string): string | undefined => {
+            if (headers instanceof Headers) {
+                return headers.get(name) || undefined;
+            }
+            const value = headers[name.toLowerCase()];
+            return Array.isArray(value) ? value[0] : value;
+        };
+
         // Validate Host header if allowedHosts is configured
         if (this._allowedHosts && this._allowedHosts.length > 0) {
-            const hostHeader = req.headers.host;
+            const hostHeader = getHeader('host');
             if (!hostHeader || !this._allowedHosts.includes(hostHeader)) {
                 return `Invalid Host header: ${hostHeader}`;
             }
@@ -208,7 +244,7 @@ export class StreamableHTTPServerTransport implements Transport {
 
         // Validate Origin header if allowedOrigins is configured
         if (this._allowedOrigins && this._allowedOrigins.length > 0) {
-            const originHeader = req.headers.origin;
+            const originHeader = getHeader('origin');
             if (!originHeader || !this._allowedOrigins.includes(originHeader)) {
                 return `Invalid Origin header: ${originHeader}`;
             }
@@ -220,9 +256,9 @@ export class StreamableHTTPServerTransport implements Transport {
     /**
      * Handles an incoming HTTP request, whether GET or POST
      */
-    async handleRequest(req: IncomingMessage & { auth?: AuthInfo }, res: ServerResponse, parsedBody?: unknown): Promise<void> {
+    async handleRequest(req: RequestLike, res: ResponseLike, parsedBody?: unknown): Promise<void> {
         // Validate request headers for DNS rebinding protection
-        const validationError = this.validateRequestHeaders(req);
+        const validationError = this.validateRequestHeaders(req.headers);
         if (validationError) {
             res.writeHead(403).end(
                 JSON.stringify({
@@ -252,9 +288,17 @@ export class StreamableHTTPServerTransport implements Transport {
     /**
      * Handles GET requests for SSE stream
      */
-    private async handleGetRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    private async handleGetRequest(req: RequestLike, res: ResponseLike): Promise<void> {
+        const getHeader = (name: string): string | undefined => {
+            if (req.headers instanceof Headers) {
+                return req.headers.get(name) || undefined;
+            }
+            const value = req.headers[name.toLowerCase()];
+            return Array.isArray(value) ? value[0] : value;
+        };
+
         // The client MUST include an Accept header, listing text/event-stream as a supported content type.
-        const acceptHeader = req.headers.accept;
+        const acceptHeader = getHeader('accept');
         if (!acceptHeader?.includes('text/event-stream')) {
             res.writeHead(406).end(
                 JSON.stringify({
@@ -280,7 +324,7 @@ export class StreamableHTTPServerTransport implements Transport {
         }
         // Handle resumability: check for Last-Event-ID header
         if (this._eventStore) {
-            const lastEventId = req.headers['last-event-id'] as string | undefined;
+            const lastEventId = getHeader('last-event-id');
             if (lastEventId) {
                 await this.replayEvents(lastEventId, res);
                 return;
@@ -318,26 +362,31 @@ export class StreamableHTTPServerTransport implements Transport {
 
         // We need to send headers immediately as messages will arrive much later,
         // otherwise the client will just wait for the first message
-        res.writeHead(200, headers).flushHeaders();
+        res.writeHead(200, headers);
+        if (res.flushHeaders) {
+            res.flushHeaders();
+        }
 
         // Assign the response to the standalone SSE stream
         this._streamMapping.set(this._standaloneSseStreamId, res);
         // Set up close handler for client disconnects
-        res.on('close', () => {
-            this._streamMapping.delete(this._standaloneSseStreamId);
-        });
+        if (res.on) {
+            res.on('close', () => {
+                this._streamMapping.delete(this._standaloneSseStreamId);
+            });
 
-        // Add error handler for standalone SSE stream
-        res.on('error', error => {
-            this.onerror?.(error as Error);
-        });
+            // Add error handler for standalone SSE stream
+            res.on('error', error => {
+                this.onerror?.(error as Error);
+            });
+        }
     }
 
     /**
      * Replays events that would have been sent after the specified event ID
      * Only used when resumability is enabled
      */
-    private async replayEvents(lastEventId: string, res: ServerResponse): Promise<void> {
+    private async replayEvents(lastEventId: string, res: ResponseLike): Promise<void> {
         if (!this._eventStore) {
             return;
         }
@@ -351,7 +400,10 @@ export class StreamableHTTPServerTransport implements Transport {
             if (this.sessionId !== undefined) {
                 headers['mcp-session-id'] = this.sessionId;
             }
-            res.writeHead(200, headers).flushHeaders();
+            res.writeHead(200, headers);
+            if (res.flushHeaders) {
+                res.flushHeaders();
+            }
 
             const streamId = await this._eventStore?.replayEventsAfter(lastEventId, {
                 send: async (eventId: string, message: JSONRPCMessage) => {
@@ -364,9 +416,11 @@ export class StreamableHTTPServerTransport implements Transport {
             this._streamMapping.set(streamId, res);
 
             // Add error handler for replay stream
-            res.on('error', error => {
-                this.onerror?.(error as Error);
-            });
+            if (res.on) {
+                res.on('error', error => {
+                    this.onerror?.(error as Error);
+                });
+            }
         } catch (error) {
             this.onerror?.(error as Error);
         }
@@ -375,7 +429,7 @@ export class StreamableHTTPServerTransport implements Transport {
     /**
      * Writes an event to the SSE stream with proper formatting
      */
-    private writeSSEEvent(res: ServerResponse, message: JSONRPCMessage, eventId?: string): boolean {
+    private writeSSEEvent(res: ResponseLike, message: JSONRPCMessage, eventId?: string): boolean {
         let eventData = `event: message\n`;
         // Include event ID if provided - this is important for resumability
         if (eventId) {
@@ -383,13 +437,14 @@ export class StreamableHTTPServerTransport implements Transport {
         }
         eventData += `data: ${JSON.stringify(message)}\n\n`;
 
-        return res.write(eventData);
+        const result = res.write(eventData);
+        return typeof result === 'boolean' ? result : true;
     }
 
     /**
      * Handles unsupported requests (PUT, PATCH, etc.)
      */
-    private async handleUnsupportedRequest(res: ServerResponse): Promise<void> {
+    private async handleUnsupportedRequest(res: ResponseLike): Promise<void> {
         res.writeHead(405, {
             Allow: 'GET, POST, DELETE'
         }).end(
@@ -407,10 +462,18 @@ export class StreamableHTTPServerTransport implements Transport {
     /**
      * Handles POST requests containing JSON-RPC messages
      */
-    private async handlePostRequest(req: IncomingMessage & { auth?: AuthInfo }, res: ServerResponse, parsedBody?: unknown): Promise<void> {
+    private async handlePostRequest(req: RequestLike, res: ResponseLike, parsedBody?: unknown): Promise<void> {
         try {
+            const getHeader = (name: string): string | undefined => {
+                if (req.headers instanceof Headers) {
+                    return req.headers.get(name) || undefined;
+                }
+                const value = req.headers[name.toLowerCase()];
+                return Array.isArray(value) ? value[0] : value;
+            };
+
             // Validate the Accept header
-            const acceptHeader = req.headers.accept;
+            const acceptHeader = getHeader('accept');
             // The client MUST include an Accept header, listing both application/json and text/event-stream as supported content types.
             if (!acceptHeader?.includes('application/json') || !acceptHeader.includes('text/event-stream')) {
                 res.writeHead(406).end(
@@ -426,7 +489,7 @@ export class StreamableHTTPServerTransport implements Transport {
                 return;
             }
 
-            const ct = req.headers['content-type'];
+            const ct = getHeader('content-type');
             if (!ct || !ct.includes('application/json')) {
                 res.writeHead(415).end(
                     JSON.stringify({
@@ -442,18 +505,52 @@ export class StreamableHTTPServerTransport implements Transport {
             }
 
             const authInfo: AuthInfo | undefined = req.auth;
-            const requestInfo: RequestInfo = { headers: req.headers };
+            const requestInfo: RequestInfo = {
+                headers:
+                    req.headers instanceof Headers
+                        ? Object.fromEntries(req.headers.entries())
+                        : (req.headers as Record<string, string | string[] | undefined>)
+            };
 
             let rawMessage;
             if (parsedBody !== undefined) {
                 rawMessage = parsedBody;
             } else {
                 const parsedCt = contentType.parse(ct);
-                const body = await getRawBody(req, {
-                    limit: MAXIMUM_MESSAGE_SIZE,
-                    encoding: parsedCt.parameters.charset ?? 'utf-8'
-                });
-                rawMessage = JSON.parse(body.toString());
+                let bodyText: string;
+
+                if (req.text) {
+                    // Fetch-style Request
+                    bodyText = await req.text();
+                    if (bodyText.length > MAXIMUM_MESSAGE_SIZE) {
+                        throw new Error('Request body too large');
+                    }
+                } else if (req.on) {
+                    // Node-style IncomingMessage
+                    const chunks: Buffer[] = [];
+                    let totalLength = 0;
+
+                    await new Promise<void>((resolve, reject) => {
+                        req.on!('data', (...args: unknown[]) => {
+                            const chunk = args[0] as Buffer;
+                            totalLength += chunk.length;
+                            if (totalLength > MAXIMUM_MESSAGE_SIZE) {
+                                reject(new Error('Request body too large'));
+                                return;
+                            }
+                            chunks.push(chunk);
+                        });
+                        req.on!('end', () => resolve());
+                        req.on!('error', reject);
+                    });
+
+                    const encoding = parsedCt.parameters.charset ?? 'utf-8';
+                    bodyText = Buffer.concat(chunks).toString(encoding as BufferEncoding);
+                } else {
+                    throw new Error('Unable to read request body');
+                }
+
+                rawMessage = JSON.parse(bodyText);
             }
 
             let messages: JSONRPCMessage[];
@@ -533,7 +630,7 @@ export class StreamableHTTPServerTransport implements Transport {
             } else if (hasRequests) {
                 // The default behavior is to use SSE streaming
                 // but in some cases server will return JSON responses
-                const streamId = randomUUID();
+                const streamId = generateUUID();
                 if (!this._enableJsonResponse) {
                     const headers: Record<string, string> = {
                         'Content-Type': 'text/event-stream',
@@ -557,14 +654,16 @@ export class StreamableHTTPServerTransport implements Transport {
                     }
                 }
                 // Set up close handler for client disconnects
-                res.on('close', () => {
-                    this._streamMapping.delete(streamId);
-                });
+                if (res.on) {
+                    res.on('close', () => {
+                        this._streamMapping.delete(streamId);
+                    });
 
-                // Add error handler for stream write errors
-                res.on('error', error => {
-                    this.onerror?.(error as Error);
-                });
+                    // Add error handler for stream write errors
+                    res.on('error', error => {
+                        this.onerror?.(error as Error);
+                    });
+                }
 
                 // handle each message
                 for (const message of messages) {
@@ -593,7 +692,7 @@ export class StreamableHTTPServerTransport implements Transport {
     /**
      * Handles DELETE requests to terminate sessions
      */
-    private async handleDeleteRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    private async handleDeleteRequest(req: RequestLike, res: ResponseLike): Promise<void> {
         if (!this.validateSession(req, res)) {
             return;
         }
@@ -609,7 +708,7 @@ export class StreamableHTTPServerTransport implements Transport {
      * Validates session ID for non-initialization requests
      * Returns true if the session is valid, false otherwise
      */
-    private validateSession(req: IncomingMessage, res: ServerResponse): boolean {
+    private validateSession(req: RequestLike, res: ResponseLike): boolean {
         if (this.sessionIdGenerator === undefined) {
             // If the sessionIdGenerator ID is not set, the session management is disabled
             // and we don't need to validate the session ID
@@ -630,7 +729,14 @@ export class StreamableHTTPServerTransport implements Transport {
             return false;
         }
 
-        const sessionId = req.headers['mcp-session-id'];
+        const getHeader = (name: string): string | string[] | undefined => {
+            if (req.headers instanceof Headers) {
+                return req.headers.get(name) || undefined;
+            }
+            return req.headers[name.toLowerCase()];
+        };
+
+        const sessionId = getHeader('mcp-session-id');
 
         if (!sessionId) {
             // Non-initialization requests without a session ID should return 400 Bad Request
@@ -675,8 +781,15 @@ export class StreamableHTTPServerTransport implements Transport {
         return true;
     }
 
-    private validateProtocolVersion(req: IncomingMessage, res: ServerResponse): boolean {
-        let protocolVersion = req.headers['mcp-protocol-version'] ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION;
+    private validateProtocolVersion(req: RequestLike, res: ResponseLike): boolean {
+        const getHeader = (name: string): string | string[] | undefined => {
+            if (req.headers instanceof Headers) {
+                return req.headers.get(name) || undefined;
+            }
+            return req.headers[name.toLowerCase()];
+        };
+
+        let protocolVersion = getHeader('mcp-protocol-version') ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION;
         if (Array.isArray(protocolVersion)) {
             protocolVersion = protocolVersion[protocolVersion.length - 1];
         }
